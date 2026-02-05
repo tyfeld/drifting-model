@@ -46,7 +46,7 @@ python sample.py --checkpoint outputs/mnist/checkpoint_final.pt --dataset mnist
 
 MNIST samples after ~8000 steps:
 
-![MNIST Samples](outputs/mnist/samples_step8000.png)
+![MNIST Samples](assets/samples_step8000.png)
 
 ## Project Structure
 

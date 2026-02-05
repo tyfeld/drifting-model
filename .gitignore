@@ -13,7 +13,6 @@ data/
 
 # Outputs
 outputs/
-*.png
 
 # IDE
 .vscode/

@@ -16,10 +16,9 @@ def compute_V(
     mask_self: bool = True,
 ) -> torch.Tensor:
     """
-    Compute the drifting field V (Algorithm 2).
+    Compute the drifting field V (Algorithm 2 from paper, Page 12).
 
-    The drifting field points generated samples toward real data (positive)
-    and away from other generated samples (negative).
+    This is the EXACT implementation from the paper's pseudocode.
 
     Args:
         x: Generated samples in feature space, shape (N, D)
@@ -42,40 +41,33 @@ def compute_V(
 
     # 2. Mask self-distances (when y_neg contains x)
     if mask_self and N == N_neg:
-        # Add large value to diagonal to exclude self-comparisons
-        mask = torch.eye(N, device=device) * 1e9
+        mask = torch.eye(N, device=device) * 1e6
         dist_neg = dist_neg + mask
 
-    # 3. Compute logits (negative distances / temperature)
+    # 3. Compute logits
     logit_pos = -dist_pos / temperature  # (N, N_pos)
     logit_neg = -dist_neg / temperature  # (N, N_neg)
 
-    # 4. Concatenate and compute soft assignment matrices
+    # 4. Concat for normalization
     logit = torch.cat([logit_pos, logit_neg], dim=1)  # (N, N_pos + N_neg)
 
-    # Normalize over y (columns) - how much each x attends to each y
-    A_row = torch.softmax(logit, dim=1)  # (N, N_pos + N_neg)
+    # 5. Normalize along BOTH dimensions (key insight from paper)
+    A_row = torch.softmax(logit, dim=1)   # softmax over y (columns)
+    A_col = torch.softmax(logit, dim=0)   # softmax over x (rows)
+    A = torch.sqrt(A_row * A_col)         # geometric mean
 
-    # Normalize over x (rows) - how much each y is attended to by each x
-    A_col = torch.softmax(logit, dim=0)  # (N, N_pos + N_neg)
-
-    # Geometric mean of the two normalizations
-    A = torch.sqrt(A_row * A_col)
-
-    # 5. Split back into positive and negative assignments
+    # 6. Split back to pos and neg
     A_pos = A[:, :N_pos]  # (N, N_pos)
     A_neg = A[:, N_pos:]  # (N, N_neg)
 
-    # 6. Compute weighted drift
-    # Weight positive by total negative attention, and vice versa
+    # 7. Compute weights (cross-weighting from paper)
     W_pos = A_pos * A_neg.sum(dim=1, keepdim=True)  # (N, N_pos)
     W_neg = A_neg * A_pos.sum(dim=1, keepdim=True)  # (N, N_neg)
 
-    # Compute drift directions
-    drift_pos = torch.mm(W_pos, y_pos)  # (N, D) - pull toward positives
-    drift_neg = torch.mm(W_neg, y_neg)  # (N, D) - push from negatives
+    # 8. Compute drift
+    drift_pos = torch.mm(W_pos, y_pos)  # (N, D)
+    drift_neg = torch.mm(W_neg, y_neg)  # (N, D)
 
-    # Total drift
     V = drift_pos - drift_neg
 
     return V

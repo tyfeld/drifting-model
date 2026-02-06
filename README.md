@@ -50,6 +50,10 @@ MNIST samples after ~8000 steps:
 
 ![MNIST Samples](assets/samples_step8000.png)
 
+CIFAR-10 samples after ~8500 steps:
+
+![CIFAR-10 Samples](assets/samples_step8500.png)
+
 ## Project Structure
 
 ```

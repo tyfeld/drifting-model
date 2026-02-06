@@ -9,7 +9,59 @@ Phase 2: Use this encoder trained with MAE objective for better results
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, List
+from typing import Optional, List, Tuple
+import torchvision.models as models
+
+
+class PretrainedResNetEncoder(nn.Module):
+    """
+    Feature encoder using pretrained ResNet.
+    Returns multi-scale feature MAPS (not pooled vectors) for per-location loss.
+
+    Following paper Section A.5: compute drifting loss at each scale/location.
+    """
+
+    def __init__(
+        self,
+        pretrained: bool = True,
+    ):
+        super().__init__()
+
+        # Load pretrained ResNet18
+        resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT if pretrained else None)
+
+        # Extract layers (don't include final fc)
+        self.conv1 = resnet.conv1
+        self.bn1 = resnet.bn1
+        self.relu = resnet.relu
+        self.maxpool = resnet.maxpool
+        self.layer1 = resnet.layer1  # 64 channels
+        self.layer2 = resnet.layer2  # 128 channels
+        self.layer3 = resnet.layer3  # 256 channels
+        self.layer4 = resnet.layer4  # 512 channels
+
+    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+        """
+        Extract multi-scale feature maps.
+
+        Returns:
+            List of feature maps at different scales, each (B, C, H, W)
+        """
+        # Resize if needed (CIFAR is 32x32)
+        if x.shape[-1] < 64:
+            x = F.interpolate(x, size=64, mode='bilinear', align_corners=False)
+
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        f1 = self.layer1(x)   # (B, 64, H/4, W/4)
+        f2 = self.layer2(f1)  # (B, 128, H/8, W/8)
+        f3 = self.layer3(f2)  # (B, 256, H/16, W/16)
+        f4 = self.layer4(f3)  # (B, 512, H/32, W/32)
+
+        return [f1, f2, f3, f4]
 
 
 class BasicBlock(nn.Module):
@@ -285,14 +337,16 @@ def create_feature_encoder(
     dataset: str = "cifar10",
     feature_dim: int = 512,
     multi_scale: bool = True,
-) -> MultiScaleFeatureEncoder:
+    use_pretrained: bool = True,
+):
     """
     Create a feature encoder for the specified dataset.
 
     Args:
         dataset: "mnist" or "cifar10"
-        feature_dim: Output feature dimension
+        feature_dim: Output feature dimension (ignored for pretrained)
         multi_scale: Whether to use multi-scale features
+        use_pretrained: Whether to use ImageNet-pretrained ResNet (for CIFAR)
 
     Returns:
         Feature encoder
@@ -306,13 +360,17 @@ def create_feature_encoder(
             multi_scale=multi_scale,
         )
     elif dataset.lower() in ["cifar10", "cifar"]:
-        return MultiScaleFeatureEncoder(
-            in_channels=3,
-            base_width=128,
-            blocks_per_stage=2,
-            feature_dim=feature_dim,
-            multi_scale=multi_scale,
-        )
+        if use_pretrained:
+            # Use ImageNet-pretrained ResNet - returns multi-scale feature maps
+            return PretrainedResNetEncoder(pretrained=True)
+        else:
+            return MultiScaleFeatureEncoder(
+                in_channels=3,
+                base_width=128,
+                blocks_per_stage=2,
+                feature_dim=feature_dim,
+                multi_scale=multi_scale,
+            )
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
 

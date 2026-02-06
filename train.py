@@ -17,7 +17,7 @@ from torchvision import datasets, transforms
 
 from model import DriftDiT_Tiny, DriftDiT_Small, DriftDiT_models
 from drifting import (
-    compute_V_multi_temperature,
+    compute_V,
     normalize_features,
     normalize_drift,
 )
@@ -74,7 +74,7 @@ CIFAR10_CONFIG = {
     "epochs": 200,
     "alpha_min": 1.0,
     "alpha_max": 3.0,
-    "use_feature_encoder": True,  # Feature space for CIFAR
+    "use_feature_encoder": True,  # Use pretrained ResNet for feature space
     "queue_size": 128,
     "label_dropout": 0.1,
 }
@@ -141,14 +141,16 @@ def compute_drifting_loss(
     use_pixel_space: bool = False,
 ) -> tuple:
     """
-    Compute class-conditional drifting loss.
+    Compute class-conditional drifting loss with multi-scale features.
+
+    Following paper Section A.5: compute drifting loss at each scale, then sum.
 
     Args:
         x_gen: Generated samples (B, C, H, W)
         labels_gen: Labels for generated samples (B,)
         x_pos: Positive (real) samples (B_pos, C, H, W)
         labels_pos: Labels for positive samples (B_pos,)
-        feature_encoder: Feature encoder (or None for pixel space)
+        feature_encoder: Feature encoder (returns List[Tensor] for multi-scale)
         temperatures: List of temperatures for V computation
         use_pixel_space: Whether to use pixel space directly
 
@@ -161,18 +163,22 @@ def compute_drifting_loss(
 
     # Extract features
     if use_pixel_space or feature_encoder is None:
-        feat_gen = x_gen.flatten(start_dim=1)
-        feat_pos = x_pos.flatten(start_dim=1)
+        # Pixel space: single scale
+        feat_gen_list = [x_gen.flatten(start_dim=1)]
+        feat_pos_list = [x_pos.flatten(start_dim=1)]
     else:
-        # feat_gen needs gradient for backprop through the generator
-        feat_gen = feature_encoder(x_gen)
-        # feat_pos doesn't need gradient (real samples)
+        # Multi-scale feature maps from pretrained encoder
+        feat_gen_maps = feature_encoder(x_gen)  # List of (B, C, H, W)
         with torch.no_grad():
-            feat_pos = feature_encoder(x_pos)
+            feat_pos_maps = feature_encoder(x_pos)
 
-    total_loss = torch.tensor(0.0, device=device)
+        # Global average pool each scale to get vectors
+        feat_gen_list = [F.adaptive_avg_pool2d(f, 1).flatten(1) for f in feat_gen_maps]
+        feat_pos_list = [F.adaptive_avg_pool2d(f, 1).flatten(1) for f in feat_pos_maps]
+
+    total_loss = torch.tensor(0.0, device=device, requires_grad=True)
     total_drift_norm = 0.0
-    count = 0
+    num_losses = 0
 
     # Compute loss per class
     for c in range(num_classes):
@@ -182,51 +188,49 @@ def compute_drifting_loss(
         if not mask_gen.any() or not mask_pos.any():
             continue
 
-        feat_gen_c = feat_gen[mask_gen]
-        feat_pos_c = feat_pos[mask_pos]
+        # Compute loss at each scale
+        for scale_idx, (feat_gen, feat_pos) in enumerate(zip(feat_gen_list, feat_pos_list)):
+            feat_gen_c = feat_gen[mask_gen]
+            feat_pos_c = feat_pos[mask_pos]
 
-        # Negatives: all other generated samples
-        mask_neg = labels_gen != c
-        if mask_neg.any():
-            feat_neg_c = feat_gen[mask_neg]
-        else:
+            # Negatives: generated samples from current class (following Algorithm 1: y_neg = x)
             feat_neg_c = feat_gen_c
 
-        # For pixel space, use simple L2 normalization
-        # This keeps all features on the unit sphere, ensuring consistent scale
-        feat_gen_c_norm = F.normalize(feat_gen_c, p=2, dim=1)
-        feat_pos_c_norm = F.normalize(feat_pos_c, p=2, dim=1)
-        feat_neg_c_norm = F.normalize(feat_neg_c, p=2, dim=1)
+            # Simple L2 normalization (projects to unit sphere)
+            feat_gen_c_norm = F.normalize(feat_gen_c, p=2, dim=1)
+            feat_pos_c_norm = F.normalize(feat_pos_c, p=2, dim=1)
+            feat_neg_c_norm = F.normalize(feat_neg_c, p=2, dim=1)
 
-        # Compute drifting field V
-        V = compute_V_multi_temperature(
-            feat_gen_c_norm,
-            feat_pos_c_norm,
-            feat_neg_c_norm,
-            temperatures,
-            mask_self=False,
-            normalize_each=True,
-        )
+            # Compute V with multiple temperatures
+            V_total = torch.zeros_like(feat_gen_c_norm)
+            for tau in temperatures:
+                V_tau = compute_V(
+                    feat_gen_c_norm,
+                    feat_pos_c_norm,
+                    feat_neg_c_norm,
+                    tau,
+                    mask_self=True,  # y_neg = x, so mask self
+                )
+                # Normalize each V before summing
+                v_norm = torch.sqrt(torch.mean(V_tau ** 2) + 1e-8)
+                V_tau = V_tau / (v_norm + 1e-8)
+                V_total = V_total + V_tau
 
-        # Don't normalize drift - let loss reflect actual generation quality
-        # V = normalize_drift(V)
+            # Loss: MSE(phi(x), stopgrad(phi(x) + V))
+            target = (feat_gen_c_norm + V_total).detach()
+            loss_scale = F.mse_loss(feat_gen_c_norm, target)
 
-        # Loss: MSE(phi(x), stopgrad(phi(x) + V))
-        target = (feat_gen_c_norm + V).detach()
-        loss_c = F.mse_loss(feat_gen_c_norm, target)
+            total_loss = total_loss + loss_scale
+            total_drift_norm += (V_total ** 2).mean().item() ** 0.5
+            num_losses += 1
 
-        n_samples = feat_gen_c.shape[0]
-        total_loss = total_loss + loss_c * n_samples
-        total_drift_norm += (V ** 2).mean().item() ** 0.5 * n_samples
-        count += n_samples
+    if num_losses == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True), {"loss": 0.0, "drift_norm": 0.0}
 
-    if count == 0:
-        return torch.tensor(0.0, device=device), {"loss": 0.0, "drift_norm": 0.0}
-
-    loss = total_loss / count
+    loss = total_loss / num_losses
     info = {
         "loss": loss.item(),
-        "drift_norm": total_drift_norm / count,
+        "drift_norm": total_drift_norm / num_losses,
     }
 
     return loss, info
@@ -409,23 +413,12 @@ def train(
             dataset=dataset,
             feature_dim=512,
             multi_scale=True,
+            use_pretrained=True,  # Use ImageNet-pretrained ResNet
         ).to(device)
 
-        # Optionally pre-train with MAE
-        mae_path = output_dir / "feature_encoder_mae.pt"
-        if mae_path.exists():
-            print("Loading pre-trained feature encoder...")
-            feature_encoder.load_state_dict(torch.load(mae_path, weights_only=True))
-        else:
-            print("Pre-training feature encoder with MAE...")
-            feature_encoder = pretrain_mae(
-                feature_encoder,
-                train_loader,
-                num_epochs=50,
-                lr=1e-3,
-                device=device,
-            )
-            torch.save(feature_encoder.state_dict(), mae_path)
+        # For pretrained ResNet, no need for MAE pre-training
+        # The ImageNet features work well for natural images
+        print("Using ImageNet-pretrained ResNet encoder")
 
         feature_encoder.eval()
         for param in feature_encoder.parameters():
@@ -600,7 +593,6 @@ def main():
         "--dataset",
         type=str,
         default="mnist",
-        choices=["mnist", "cifar10"],
         help="Dataset to train on",
     )
     parser.add_argument(

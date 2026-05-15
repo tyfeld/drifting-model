@@ -80,7 +80,7 @@ CIFAR10_CONFIG = {
 }
 
 
-def get_dataset(name: str, root: str = "/home/qingtianzhu.ty/drifting/data") -> tuple:
+def get_dataset(name: str, root: str = "/home/bangjiy2/code/data") -> tuple:
     """Get dataset and transforms."""
     if name.lower() == "mnist":
         # MNIST data is at {root}/mnist/MNIST/raw/
@@ -90,8 +90,8 @@ def get_dataset(name: str, root: str = "/home/qingtianzhu.ty/drifting/data") -> 
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),  # [-1, 1]
         ])
-        train_dataset = datasets.MNIST(mnist_root, train=True, download=False, transform=transform)
-        test_dataset = datasets.MNIST(mnist_root, train=False, download=False, transform=transform)
+        train_dataset = datasets.MNIST(mnist_root, train=True, download=True, transform=transform)
+        test_dataset = datasets.MNIST(mnist_root, train=False, download=True, transform=transform)
     elif name.lower() in ["cifar10", "cifar"]:
         transform = transforms.Compose([
             transforms.RandomHorizontalFlip(),
